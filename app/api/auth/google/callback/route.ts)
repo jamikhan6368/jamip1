@@ -1,0 +1,48 @@
+import { NextResponse } from "next/server";
+import { db } from "@/lib/db";
+import { signToken } from "@/lib/auth";
+
+export async function GET(req: Request) {
+  const { searchParams } = new URL(req.url);
+  const code = searchParams.get("code");
+
+  const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      client_id: process.env.GOOGLE_CLIENT_ID!,
+      client_secret: process.env.GOOGLE_CLIENT_SECRET!,
+      code: code!,
+      grant_type: "authorization_code",
+      redirect_uri: process.env.GOOGLE_REDIRECT_URI!
+    })
+  });
+
+  const tokenJson = await tokenRes.json();
+  const accessToken = tokenJson.access_token;
+
+  const userRes = await fetch(
+    "https://www.googleapis.com/oauth2/v2/userinfo",
+    { headers: { Authorization: `Bearer ${accessToken}` } }
+  );
+
+  const user = await userRes.json();
+
+  // Insert or update user
+  const dbRes = await db.query(
+    `
+      INSERT INTO users (google_id, email, name, avatar_url)
+      VALUES ($1, $2, $3, $4)
+      ON CONFLICT (google_id) DO UPDATE
+        SET email=$2, name=$3, avatar_url=$4
+      RETURNING id;
+    `,
+    [user.id, user.email, user.name, user.picture]
+  );
+
+  const token = signToken({ user_id: dbRes.rows[0].id });
+
+  return NextResponse.redirect(
+    `chrome-extension://EXTENSION_ID/popup.html#token=${token}&email=${user.email}`
+  );
+}
