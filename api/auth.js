@@ -13,68 +13,70 @@ export default async function handler(req, res) {
 
   if (req.method === 'OPTIONS') return res.status(200).end();
 
-  // --- SUBMIT PAYMENT (POST) ---
+  // --- SUBMIT PAYMENT DETAILS (POST) ---
   if (req.method === 'POST') {
       const { googleToken, transactionId, method, device } = req.body;
-      
       try {
-          // Verify Google Token
           const gRes = await fetch(`https://www.googleapis.com/oauth2/v3/userinfo?access_token=${googleToken}`);
           const gUser = await gRes.json();
           if (!gUser.email) return res.status(400).json({ error: 'Invalid Google Token' });
 
           const client = await pool.connect();
-          
-          // Check if already exists
-          const check = await client.query('SELECT * FROM licenses WHERE email = $1', [gUser.email]);
-          if (check.rows.length > 0) {
-              // If exists but inactive, update TRX
-              await client.query(
-                  'UPDATE licenses SET transaction_id = $1, payment_method = $2 WHERE email = $3',
-                  [transactionId, method, gUser.email]
-              );
-          } else {
-              // Create new PENDING account (is_active = FALSE)
-              // Expiration set to NOW (so it's expired until approved)
-              await client.query(
-                  `INSERT INTO licenses (email, device_id, transaction_id, payment_method, is_active, expires_at) 
-                   VALUES ($1, $2, $3, $4, FALSE, NOW())`,
-                  [gUser.email, device, transactionId, method]
-              );
-          }
+          // Update the existing user with payment details
+          await client.query(
+              'UPDATE licenses SET transaction_id = $1, payment_method = $2, device_id = $3 WHERE email = $4',
+              [transactionId, method, device, gUser.email]
+          );
           client.release();
           return res.status(200).json({ success: true });
-
       } catch (err) {
           return res.status(500).json({ error: err.message });
       }
   }
 
-  // --- LOGIN CHECK (GET) ---
+  // --- LOGIN / CHECK STATUS (GET) ---
   const { googleToken, device } = req.query;
-  if (!device || !googleToken) return res.status(400).json({ error: 'Missing Data' });
+  if (!googleToken) return res.status(400).json({ error: 'Missing Token' });
 
   try {
     const client = await pool.connect();
     
-    // Verify Google
+    // 1. Verify Google
     const gRes = await fetch(`https://www.googleapis.com/oauth2/v3/userinfo?access_token=${googleToken}`);
     const gUser = await gRes.json();
-    if (!gUser.email) { client.release(); return res.status(403).json({ error: 'Invalid Google Token' }); }
-
-    // Check DB
-    const result = await client.query('SELECT * FROM licenses WHERE email = $1', [gUser.email]);
-    const license = result.rows[0];
-    client.release();
-
-    if (!license) {
-        // User needs to pay
-        return res.status(402).json({ error: 'PAYMENT_REQUIRED' });
+    
+    if (!gUser.email) { 
+        client.release(); 
+        return res.status(403).json({ error: 'Invalid Google Token' }); 
     }
 
+    // 2. Check DB
+    let result = await client.query('SELECT * FROM licenses WHERE email = $1', [gUser.email]);
+    let license = result.rows[0];
+
+    // 3. AUTO-CREATE USER IF MISSING (The Fix)
+    if (!license) {
+        // Create a new "Pending" user immediately
+        const newEntry = await client.query(
+            `INSERT INTO licenses (email, role, is_active, expires_at, device_id) 
+             VALUES ($1, 'user', FALSE, NOW(), $2) 
+             RETURNING *`,
+            [gUser.email, device]
+        );
+        license = newEntry.rows[0];
+        console.log("New User Created:", gUser.email);
+    }
+
+    client.release();
+
+    // 4. Status Checks
     if (!license.is_active) {
-        // User paid, waiting for you
-        return res.status(403).json({ error: 'PENDING_APPROVAL', msg: 'Payment under review. Please wait.' });
+        // If they have a Transaction ID, they are waiting for approval
+        if (license.transaction_id) {
+            return res.status(403).json({ error: 'PENDING_APPROVAL' });
+        }
+        // If no transaction ID, they need to pay
+        return res.status(402).json({ error: 'PAYMENT_REQUIRED' });
     }
 
     // Check Expiry
@@ -87,10 +89,11 @@ export default async function handler(req, res) {
         return res.status(403).json({ error: 'LOCKED_TO_OTHER_DEVICE' });
     }
 
-    // Success
+    // 5. Success - Send Code
     res.status(200).send(automationCode);
 
   } catch (error) {
+    console.error(error);
     res.status(500).json({ error: 'Server Error' });
   }
 }
