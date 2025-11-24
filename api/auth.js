@@ -7,6 +7,7 @@ const pool = new Pool({
 });
 
 export default async function handler(req, res) {
+  // CORS Headers
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -19,20 +20,28 @@ export default async function handler(req, res) {
   if (!googleToken) return res.status(400).json({ error: 'Missing Token' });
 
   try {
-    // 1. VERIFY GOOGLE TOKEN (Using Fetch for Access Tokens)
+    // 1. VERIFY ACCESS TOKEN (Fetch Method)
+    // We query Google directly. This supports the 'ya29...' tokens.
     const googleRes = await fetch(`https://www.googleapis.com/oauth2/v3/userinfo?access_token=${googleToken}`);
     
-    if (!googleRes.ok) return res.status(403).json({ error: 'Invalid Google Token' });
+    if (!googleRes.ok) {
+        // If this fails, the token is expired or invalid
+        return res.status(403).json({ error: 'Google Token Expired. Please Login Again.' });
+    }
     
     const googleUser = await googleRes.json();
     const email = googleUser.email;
 
+    if (!email) return res.status(403).json({ error: 'No email found in token' });
+
+    // 2. DATABASE CHECK
     const client = await pool.connect();
     let result = await client.query('SELECT * FROM licenses WHERE email = $1', [email]);
     let license = result.rows[0];
 
-    // 2. AUTO-CREATE IF NEW
+    // 3. AUTO-CREATE USER
     if (!license) {
+        console.log("Creating new user:", email);
         const newRow = await client.query(
             `INSERT INTO licenses (email, role, is_active, expires_at, device_id) 
              VALUES ($1, 'user', FALSE, NOW(), $2) 
@@ -42,7 +51,7 @@ export default async function handler(req, res) {
         license = newRow.rows[0];
     }
 
-    // 3. HANDLE PAYMENT SUBMISSION
+    // 4. HANDLE PAYMENT
     if (req.method === 'POST' && transactionId) {
         await client.query(
             'UPDATE licenses SET transaction_id = $1, payment_method = $2, device_id = $3 WHERE email = $4',
@@ -52,16 +61,14 @@ export default async function handler(req, res) {
         return res.status(200).json({ success: true });
     }
 
-    // 4. SMART DEVICE LOCK (The Fix for Reinstall/Multiple PCs)
-    // We update the DB with the CURRENT device ID. 
-    // This allows the user to switch PCs, but ensures only the latest one is valid.
+    // 5. UPDATE DEVICE ID (Roaming Support)
     if (license.device_id !== device) {
         await client.query('UPDATE licenses SET device_id = $1 WHERE email = $2', [device, email]);
     }
 
     client.release();
 
-    // 5. STATUS CHECKS
+    // 6. STATUS CHECKS
     if (!license.is_active) {
         if (license.transaction_id) return res.status(403).json({ error: 'PENDING_APPROVAL' });
         return res.status(402).json({ error: 'PAYMENT_REQUIRED' });
@@ -71,11 +78,11 @@ export default async function handler(req, res) {
         return res.status(402).json({ error: 'EXPIRED' });
     }
 
-    // 6. SUCCESS - SEND FULL CODE
+    // 7. SUCCESS
     res.status(200).send(automationCode);
 
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: 'Server Error' });
+    console.error("Server Error:", error);
+    res.status(500).json({ error: 'Server Internal Error' });
   }
 }
