@@ -7,7 +7,6 @@ const pool = new Pool({
 });
 
 export default async function handler(req, res) {
-  // CORS Headers
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -20,69 +19,65 @@ export default async function handler(req, res) {
   if (!googleToken) return res.status(400).json({ error: 'Missing Token' });
 
   try {
-    // 1. VERIFY ACCESS TOKEN (Fetch Method)
-    // We query Google directly. This supports the 'ya29...' tokens.
-    const googleRes = await fetch(`https://www.googleapis.com/oauth2/v3/userinfo?access_token=${googleToken}`);
+    // 1. VERIFY IDENTITY
+    const gRes = await fetch(`https://www.googleapis.com/oauth2/v3/userinfo?access_token=${googleToken}`);
+    if (!gRes.ok) return res.status(403).json({ error: 'Invalid Token' });
+    const user = await gRes.json();
     
-    if (!googleRes.ok) {
-        // If this fails, the token is expired or invalid
-        return res.status(403).json({ error: 'Google Token Expired. Please Login Again.' });
-    }
-    
-    const googleUser = await googleRes.json();
-    const email = googleUser.email;
-
-    if (!email) return res.status(403).json({ error: 'No email found in token' });
-
-    // 2. DATABASE CHECK
     const client = await pool.connect();
-    let result = await client.query('SELECT * FROM licenses WHERE email = $1', [email]);
+    
+    // 2. GET / CREATE USER
+    let result = await client.query('SELECT * FROM licenses WHERE email = $1', [user.email]);
     let license = result.rows[0];
 
-    // 3. AUTO-CREATE USER
     if (!license) {
-        console.log("Creating new user:", email);
+        // Create new INACTIVE user
         const newRow = await client.query(
             `INSERT INTO licenses (email, role, is_active, expires_at, device_id) 
-             VALUES ($1, 'user', FALSE, NOW(), $2) 
-             RETURNING *`,
-            [email, device]
+             VALUES ($1, 'user', FALSE, NOW(), $2) RETURNING *`,
+            [user.email, device]
         );
         license = newRow.rows[0];
     }
 
-    // 4. HANDLE PAYMENT
+    // 3. HANDLE PAYMENT SUBMISSION
     if (req.method === 'POST' && transactionId) {
         await client.query(
-            'UPDATE licenses SET transaction_id = $1, payment_method = $2, device_id = $3 WHERE email = $4',
-            [transactionId, method, device, email]
+            'UPDATE licenses SET transaction_id = $1, payment_method = $2 WHERE email = $3',
+            [transactionId, method, user.email]
         );
         client.release();
         return res.status(200).json({ success: true });
     }
 
-    // 5. UPDATE DEVICE ID (Roaming Support)
-    if (license.device_id !== device) {
-        await client.query('UPDATE licenses SET device_id = $1 WHERE email = $2', [device, email]);
-    }
-
     client.release();
 
-    // 6. STATUS CHECKS
+    // 4. DECISION LOGIC
+    // A. If Pending Approval
+    if (!license.is_active && license.transaction_id) {
+        return res.status(403).json({ error: 'PENDING_APPROVAL' });
+    }
+    
+    // B. If Unpaid (Inactive)
     if (!license.is_active) {
-        if (license.transaction_id) return res.status(403).json({ error: 'PENDING_APPROVAL' });
         return res.status(402).json({ error: 'PAYMENT_REQUIRED' });
     }
 
+    // C. If Expired
     if (new Date() > new Date(license.expires_at)) {
         return res.status(402).json({ error: 'EXPIRED' });
     }
 
-    // 7. SUCCESS
+    // D. If Locked to another PC
+    if (license.device_id && license.device_id !== device) {
+        // Auto-update device ID for Pro users (Roaming)
+        await pool.query('UPDATE licenses SET device_id = $1 WHERE email = $2', [device, user.email]);
+    }
+
+    // E. SUCCESS -> SEND THE APP
     res.status(200).send(automationCode);
 
   } catch (error) {
-    console.error("Server Error:", error);
-    res.status(500).json({ error: 'Server Internal Error' });
+    res.status(500).json({ error: 'Server Error' });
   }
 }
