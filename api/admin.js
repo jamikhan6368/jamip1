@@ -7,7 +7,7 @@ const pool = new Pool({
 });
 
 // Use the Web Client ID you just created in Step 1
-const CLIENT_ID = "YOUR_NEW_WEB_CLIENT_ID_HERE.apps.googleusercontent.com"; 
+const CLIENT_ID = "1078904057208-m653sh6blj9ae4icq54l3cgljljkm61u.apps.googleusercontent.com"; 
 const client = new OAuth2Client(CLIENT_ID);
 
 export default async function handler(req, res) {
