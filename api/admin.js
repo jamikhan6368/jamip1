@@ -6,7 +6,7 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-// ⚠️ YOUR WEB CLIENT ID (Must match what is in admin.html)
+// YOUR CLIENT ID
 const CLIENT_ID = "1078904057208-m653sh6blj9ae4icq54l3cgljljkm61u.apps.googleusercontent.com";
 const client = new OAuth2Client(CLIENT_ID);
 
@@ -24,7 +24,7 @@ export default async function handler(req, res) {
   const token = authHeader.split(' ')[1];
 
   try {
-    // 1. Verify who is logging in via Google
+    // 1. Verify Google Identity
     const ticket = await client.verifyIdToken({
         idToken: token,
         audience: CLIENT_ID,
@@ -32,33 +32,38 @@ export default async function handler(req, res) {
     const payload = ticket.getPayload();
     const email = payload.email;
 
+    console.log("--- LOGIN ATTEMPT ---");
+    console.log("Google Email:", email); // DEBUG LOG
+
     const db = await pool.connect();
 
-    // 2. DATABASE CHECK: Look for this email in Neon
-    const result = await db.query('SELECT role FROM licenses WHERE email = $1', [email]);
+    // 2. DATABASE CHECK (Case Insensitive)
+    // We use LOWER() to make sure 'User@Gmail.com' matches 'user@gmail.com'
+    const result = await db.query('SELECT * FROM licenses WHERE LOWER(email) = LOWER($1)', [email]);
     const user = result.rows[0];
 
-    // 3. VALIDATION: Check if they exist AND are an admin
+    console.log("Database User Found:", user); // DEBUG LOG
+
     if (!user) {
         db.release();
-        return res.status(403).json({ error: 'Access Denied: User not found in database.' });
+        console.log("ERROR: User not found in DB");
+        return res.status(403).json({ error: `Access Denied: Email (${email}) not found in database.` });
     }
 
     if (user.role !== 'admin') {
         db.release();
-        return res.status(403).json({ error: 'Access Denied: You do not have Admin permissions.' });
+        console.log("ERROR: User role is", user.role);
+        return res.status(403).json({ error: 'Access Denied: You are not an Admin.' });
     }
 
-    // --- IF WE REACH HERE, YOU ARE APPROVED ---
+    // --- SUCCESS ---
 
-    // A. GET LIST
     if (req.method === 'GET') {
         const list = await db.query('SELECT * FROM licenses ORDER BY created_at DESC');
         db.release();
         return res.status(200).json(list.rows);
     }
 
-    // B. ADD NEW USER
     if (req.method === 'POST') {
         const { type, value, days } = req.body; 
         let query = '';
@@ -78,11 +83,10 @@ export default async function handler(req, res) {
             return res.status(200).json(newRow.rows[0]);
         } catch(err) {
             db.release();
-            return res.status(400).json({ error: 'User already exists or Invalid Data.' });
+            return res.status(400).json({ error: 'Entry already exists.' });
         }
     }
 
-    // C. DELETE USER
     if (req.method === 'DELETE') {
         const { id } = req.query;
         await db.query('DELETE FROM licenses WHERE key_id = $1', [id]);
@@ -91,7 +95,7 @@ export default async function handler(req, res) {
     }
 
   } catch (error) {
-    console.error(error);
+    console.error("SERVER ERROR:", error);
     return res.status(500).json({ error: 'Server Error: ' + error.message });
   }
 }
