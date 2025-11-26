@@ -1,4 +1,5 @@
-import sql from "@/lib/db";
+// app/api/admin/payment/reject/route.js
+import sql from "../../../../lib/db";
 
 function isAdmin(req) {
   const header = req.headers.get("x-admin-secret") || "";
