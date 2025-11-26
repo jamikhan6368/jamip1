@@ -1,5 +1,6 @@
-import sql from "@/lib/db";
-import { extendSubscription } from "@/lib/subscription";
+// app/api/admin/payment/approve/route.js
+import sql from "../../../../lib/db";
+import { extendSubscription } from "../../../../lib/subscription";
 
 function isAdmin(req) {
   const header = req.headers.get("x-admin-secret") || "";
