@@ -1,5 +1,6 @@
-import sql from "@/lib/db";
-import { getActiveSubscription, ensureDevice } from "@/lib/subscription";
+// app/api/check-subscription/route.js
+import sql from "../../../lib/db";
+import { getActiveSubscription, ensureDevice } from "../../../lib/subscription";
 
 export async function POST(req) {
   try {
