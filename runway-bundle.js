@@ -1,0 +1,534 @@
+// runway-bundle.js
+// COMBINED LOGIC: Floating UI + Automation + Folder Parsing
+// ADAPTED FOR: Remote Loading (No chrome.* APIs)
+
+(() => {
+  // --- PREVENT DUPLICATE LOADS ---
+  if (window.RunwayProLoaded) return;
+  window.RunwayProLoaded = true;
+
+  console.log("🚀 Remote Automation Logic Initialized");
+
+  // =================================================
+  // 1. GLOBAL STATE & UTILS
+  // =================================================
+  const STATE = {
+      isRunning: false,
+      stopRequested: false,
+      isPaused: false,
+      theme: localStorage.getItem('rw_theme') || 'dark',
+      targets: ['assets', 'search', 'image', 'prompt', 'remove']
+  };
+
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  // REPLACEMENT FOR CHROME.STORAGE -> LOCALSTORAGE
+  const Storage = {
+      get: (key) => {
+          try { return JSON.parse(localStorage.getItem(key)) || {}; } 
+          catch (e) { return {}; }
+      },
+      set: (key, val) => {
+          localStorage.setItem(key, JSON.stringify(val));
+      }
+  };
+
+  // =================================================
+  // 2. FOLDER & AUTH LOGIC (Originally runwayFoldersContent.js)
+  // =================================================
+  function getAuth() {
+    let token = localStorage.getItem("RW_USER_TOKEN");
+    if (!token) {
+        const m = document.cookie.match(/RW_USER_TOKEN=([^;]+)/);
+        if (m) token = m[1];
+    }
+    if (token) {
+        if (token.includes("%20")) token = decodeURIComponent(token);
+        if (!token.toLowerCase().startsWith("bearer ")) token = "Bearer " + token;
+    }
+    // Try to find Team ID in local storage or fallback
+    let teamId = localStorage.getItem("TEAM_ID");
+    if(!teamId) {
+        // Attempt to scrape it from page scripts if possible, otherwise default
+        // This is a basic fallback
+        teamId = "2493493"; 
+    }
+    return { token, teamId };
+  }
+
+  async function getAssetsInFolder(folderId) {
+      const { token, teamId } = getAuth();
+      if(!token) throw new Error("Not logged in (Token missing)");
+
+      const allAssets = [];
+      let cursor = null;
+      
+      updateStatus("Fetching Assets...", "#38bdf8");
+      
+      // Safety break to prevent infinite loops
+      let loops = 0;
+      do {
+          if(loops++ > 50) break; 
+          let url = `https://api.runwayml.com/v2/assets?limit=500&asTeamId=${teamId}&privateInTeam=true&parentAssetGroupId=${folderId}&mediaTypes%5B%5D=image`;
+          if(cursor) url += `&cursor=${encodeURIComponent(cursor)}`;
+          
+          const res = await fetch(url, { headers: { "Authorization": token } });
+          if(!res.ok) throw new Error("API Error: " + res.status);
+          
+          const json = await res.json();
+          const assets = json.assets || [];
+          allAssets.push(...assets);
+          cursor = json.nextCursor;
+          
+          await sleep(100);
+      } while(cursor);
+      
+      return allAssets;
+  }
+
+  async function loadFolders() {
+      const sel = document.getElementById('folderSelect');
+      if(!sel) return;
+      
+      const { token, teamId } = getAuth();
+      if (!token) {
+          sel.innerHTML = '<option>Not Logged In</option>';
+          return;
+      }
+
+      try {
+          sel.innerHTML = '<option>Loading...</option>';
+          const url = `https://api.runwayml.com/v1/asset_groups?privateInTeam=true&asTeamId=${teamId}`;
+          const res = await fetch(url, { headers: { "Authorization": token } });
+          const json = await res.json();
+          
+          sel.innerHTML = '';
+          const groups = Array.isArray(json) ? json : (json.assetGroups || []);
+          
+          if(groups.length === 0) {
+               sel.innerHTML = '<option value="">No Folders Found</option>';
+          } else {
+              groups.forEach(g => { 
+                  const opt = document.createElement('option'); 
+                  opt.value = g.id || g.assetGroupId; 
+                  opt.textContent = g.name || g.title; 
+                  sel.appendChild(opt); 
+              });
+          }
+      } catch(e) { 
+          console.error(e);
+          sel.innerHTML = '<option>Error loading folders</option>'; 
+      }
+  }
+
+  // =================================================
+  // 3. UI CONSTRUCTION
+  // =================================================
+  function createFloatingUI() {
+      if (document.getElementById("runway-pro-root")) return;
+
+      const style = document.createElement("style");
+      style.textContent = `
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+        #runway-pro-root {
+            position: fixed; top: 50%; right: 20px; transform: translateY(-50%);
+            z-index: 2147483647; font-family: 'Inter', sans-serif;
+            display: flex; flex-direction: column; align-items: flex-end;
+            --bg: #050816; --bg-panel: #0b0b0f; --bg-input: #131316;
+            --bg-hover: rgba(255,255,255,0.05); --border-color: #27272a;
+            --text-main: #e2e8f0; --text-muted: #94a3b8;
+            --accent-cyan: #06b6d4; --accent-pink: #d946ef;
+            --gradient-primary: linear-gradient(135deg, #9d4edd, #ff007f);
+            --shadow-panel: 0 30px 80px rgba(0,0,0,0.95);
+        }
+        #runway-pro-root.light-mode {
+            --bg: #ffffff; --bg-panel: #f8fafc; --bg-input: #e2e8f0;
+            --bg-hover: rgba(0,0,0,0.05); --border-color: #cbd5e1;
+            --text-main: #0f172a; --text-muted: #64748b;
+        }
+        #runway-pro-toggle {
+            position: fixed; bottom: 30px; right: 30px; width: 60px; height: 60px;
+            border-radius: 50%; background: var(--bg-panel); border: 1px solid var(--border-color);
+            color: var(--accent-pink); display: flex; align-items: center; justify-content: center;
+            cursor: pointer; box-shadow: 0 4px 15px rgba(0,0,0,0.3); transition: 0.2s; z-index: 2147483648;
+        }
+        #runway-pro-toggle:hover { transform: scale(1.1); color: var(--accent-cyan); }
+        #runway-pro-panel {
+            width: 500px; background: var(--bg-panel); color: var(--text-main);
+            border: 1px solid var(--border-color); border-radius: 16px; display: none;
+            flex-direction: column; box-shadow: var(--shadow-panel); max-height: 90vh; overflow-y: auto;
+            padding: 20px; gap: 16px;
+        }
+        #runway-pro-panel.show { display: flex; }
+        
+        .header { display: flex; justify-content: space-between; align-items: center; }
+        .brand-title { font-size: 18px; font-weight: 800; background: linear-gradient(90deg, #9d4edd, #ff007f); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        
+        .panel-sec { background: var(--bg-hover); border: 1px solid var(--border-color); border-radius: 12px; padding: 16px; display: flex; flex-direction: column; gap: 10px; }
+        .sec-lbl { font-size: 11px; text-transform: uppercase; color: var(--text-muted); font-weight: 700; border-bottom: 1px solid var(--border-color); padding-bottom: 5px; margin-bottom: 5px; }
+
+        .train-row { display: flex; align-items: center; justify-content: space-between; padding: 6px 0; }
+        .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #475569; margin-right: 8px; }
+        .status-dot.active { background: #22c55e; box-shadow: 0 0 6px #22c55e; }
+        
+        .btn { border: none; border-radius: 6px; padding: 6px 12px; font-size: 11px; font-weight: 600; cursor: pointer; }
+        .btn-outline { background: transparent; border: 1px solid var(--border-color); color: var(--text-muted); }
+        .btn-outline:hover { color: var(--text-main); border-color: var(--text-main); }
+        .btn-primary { background: var(--gradient-primary); color: white; width: 100%; padding: 14px; margin-top: 10px; }
+
+        .main-input { width: 100%; background: var(--bg-input); border: 1px solid var(--border-color); color: var(--text-main); padding: 10px; border-radius: 8px; outline: none; }
+        .status-banner { background: var(--bg-input); color: var(--accent-cyan); padding: 10px; border-radius: 8px; text-align: center; font-size: 12px; font-weight: 600; }
+        
+        #runway-status-pill {
+            position: fixed; bottom: 35px; right: 100px; z-index: 2147483648;
+            background: var(--bg-panel); border: 1px solid var(--border-color);
+            padding: 10px 20px; border-radius: 50px; color: var(--text-main); font-size: 12px;
+            display: flex; align-items: center; gap: 8px; opacity: 0; pointer-events: none; transition: 0.3s;
+        }
+        #runway-status-pill.visible { opacity: 1; transform: translateY(0); }
+        .pill-dot { width: 8px; height: 8px; border-radius: 50%; background: #94a3b8; }
+      `;
+      document.head.appendChild(style);
+
+      const root = document.createElement("div");
+      root.id = "runway-pro-root";
+      if(STATE.theme === 'light') root.classList.add('light-mode');
+
+      // HTML STRUCTURE
+      root.innerHTML = `
+        <div id="runway-pro-toggle">🤖</div>
+        <div id="runway-pro-panel">
+          <div class="header">
+            <div><div class="brand-title">Runway Automation</div><div style="font-size:10px; color:#94a3b8;">Vercel Remote Loaded</div></div>
+            <button id="close-btn" class="btn btn-outline">✕</button>
+          </div>
+
+          <div class="panel-sec">
+            <div class="sec-lbl">Training</div>
+            ${['assets','search','image','remove','prompt'].map(t => `
+                <div class="train-row">
+                    <div style="display:flex;align-items:center;">
+                        <div class="status-dot" id="dot-${t}"></div>
+                        <span style="font-size:11px;font-weight:500;">${t.toUpperCase()}</span>
+                    </div>
+                    <div>
+                        ${(t==='assets'||t==='image') ? `<select id="clicks-${t}" style="background:#131316;color:#fff;border:1px solid #333;border-radius:4px;"><option value="1">1x</option><option value="2" ${t==='image'?'selected':''}>2x</option></select>` : ''}
+                        <button class="btn btn-outline btn-train" data-target="${t}">Set</button>
+                        <button class="btn btn-outline btn-test" data-target="${t}">Test</button>
+                    </div>
+                </div>
+            `).join('')}
+          </div>
+
+          <div class="panel-sec">
+            <div class="sec-lbl">Execution</div>
+            <select id="folderSelect" class="main-input"><option>Loading...</option></select>
+            <input type="file" id="csvFile" accept=".csv" class="main-input" style="padding:6px;" />
+            
+            <div style="display:flex; gap:10px; margin-top:5px;">
+                <select id="delayPreset" class="main-input">
+                    <option value="5-8">Delay: 5-8s</option>
+                    <option value="8-12">Delay: 8-12s</option>
+                </select>
+                <select id="promptStyle" class="main-input">
+                    <option value="low">Motion: Low</option>
+                    <option value="medium">Motion: Medium</option>
+                    <option value="high">Motion: High</option>
+                </select>
+            </div>
+
+            <button id="startAutoBtn" class="btn-primary">Start Batch</button>
+            <div style="display:flex; gap:5px;">
+                <button id="pauseAutoBtn" class="btn btn-outline" style="flex:1;">Pause</button>
+                <button id="stopAutoBtn" class="btn btn-outline" style="flex:1; border-color:#ef4444; color:#ef4444;">Stop</button>
+            </div>
+            
+            <div class="status-banner" id="statusBox">Ready</div>
+            <button id="resetMemoryBtn" style="background:none; border:none; color:#666; font-size:10px; text-decoration:underline; cursor:pointer; margin-top:5px;">Reset Training</button>
+        </div>
+      `;
+
+      document.body.appendChild(root);
+      
+      const pill = document.createElement('div');
+      pill.id = "runway-status-pill";
+      pill.innerHTML = `<div class="pill-dot" id="pill-dot"></div><span id="pill-text">Ready</span>`;
+      document.body.appendChild(pill);
+
+      // BIND EVENTS
+      document.getElementById('runway-pro-toggle').onclick = () => {
+          document.getElementById('runway-pro-panel').classList.add('show');
+          document.getElementById('runway-pro-toggle').style.display = 'none';
+      };
+      document.getElementById('close-btn').onclick = () => {
+          document.getElementById('runway-pro-panel').classList.remove('show');
+          document.getElementById('runway-pro-toggle').style.display = 'flex';
+      };
+
+      STATE.targets.forEach(t => {
+          document.querySelector(`.btn-train[data-target="${t}"]`).onclick = () => startTraining(t);
+          document.querySelector(`.btn-test[data-target="${t}"]`).onclick = () => testTarget(t);
+      });
+
+      document.getElementById('startAutoBtn').onclick = handleStart;
+      document.getElementById('stopAutoBtn').onclick = () => { STATE.stopRequested = true; updateStatus("Stopping...", "#ef4444"); };
+      document.getElementById('pauseAutoBtn').onclick = togglePause;
+      document.getElementById('resetMemoryBtn').onclick = resetTraining;
+
+      loadFolders();
+      checkCalibration();
+  }
+
+  // =================================================
+  // 4. TRAINING & CALIBRATION (LocalStorage Version)
+  // =================================================
+  function updateStatus(msg, color) {
+      const el = document.getElementById('statusBox');
+      if(el) { el.textContent = msg; el.style.color = color || "#06b6d4"; }
+      
+      const pill = document.getElementById('runway-status-pill');
+      if(pill) {
+          pill.classList.add('visible');
+          document.getElementById('pill-text').textContent = msg;
+          document.getElementById('pill-dot').style.background = color || "#06b6d4";
+      }
+  }
+
+  function togglePause() {
+      STATE.isPaused = !STATE.isPaused;
+      document.getElementById('pauseAutoBtn').textContent = STATE.isPaused ? "Resume" : "Pause";
+      updateStatus(STATE.isPaused ? "PAUSED" : "Resuming...");
+  }
+
+  function checkCalibration() {
+      const s = Storage.get('rw_selectors');
+      STATE.targets.forEach(t => {
+          const dot = document.getElementById(`dot-${t}`);
+          if(dot) s[t] ? dot.classList.add('active') : dot.classList.remove('active');
+      });
+  }
+
+  function startTraining(target) {
+      document.getElementById('runway-pro-panel').classList.remove('show');
+      
+      const banner = document.createElement('div');
+      Object.assign(banner.style, {
+          position:'fixed', top:'0', left:'0', width:'100%', padding:'20px',
+          background:'#d946ef', color:'white', textAlign:'center', zIndex:'9999999', 
+          fontWeight:'bold', fontSize:'16px'
+      });
+      banner.innerText = `CLICK THE [${target.toUpperCase()}] ELEMENT`;
+      document.body.appendChild(banner);
+
+      const handler = (e) => {
+          e.preventDefault(); e.stopPropagation();
+          const coord = `COORD:${e.clientX},${e.clientY}`;
+          const s = Storage.get('rw_selectors');
+          s[target] = coord;
+          Storage.set('rw_selectors', s);
+          
+          banner.remove();
+          document.getElementById('runway-pro-panel').classList.add('show');
+          checkCalibration();
+          
+          document.removeEventListener('click', handler, true);
+          document.removeEventListener('mouseover', hover, true);
+          e.target.style.outline = "";
+      };
+      
+      const hover = (e) => { e.target.style.outline = "2px dashed #00ffcc"; };
+      
+      document.addEventListener('click', handler, true);
+      document.addEventListener('mouseover', hover, true);
+  }
+
+  function testTarget(target) {
+      const s = Storage.get('rw_selectors');
+      if(s[target]) performClick(s[target], 1000, target==='image');
+      else alert("Train first!");
+  }
+
+  function resetTraining() {
+      if(confirm("Reset training?")) {
+          Storage.set('rw_selectors', {});
+          checkCalibration();
+      }
+  }
+
+  async function performClick(targetData, timeout = 3000, isDoubleClick = false) {
+      if (!targetData) return false;
+      let x = 0, y = 0, el = null;
+      
+      if (targetData.startsWith("COORD:")) {
+          [x, y] = targetData.split(":")[1].split(",").map(Number);
+          el = document.elementFromPoint(x, y);
+      }
+      
+      if (!el) return false;
+      
+      const old = el.style.outline;
+      el.style.outline = "2px solid #d946ef"; await sleep(200);
+      
+      const opts = { bubbles:true, cancelable:true, view:window, buttons:1, clientX:x, clientY:y };
+      el.dispatchEvent(new MouseEvent('mousedown', opts));
+      el.dispatchEvent(new MouseEvent('mouseup', opts));
+      el.click();
+      
+      if(isDoubleClick) { await sleep(50); el.click(); }
+      
+      setTimeout(() => el.style.outline = old, 300);
+      return true;
+  }
+
+  // =================================================
+  // 5. PARSING & EXECUTION
+  // =================================================
+  function normalizeName(name) { return name ? name.toLowerCase().replace(/\.(jpg|jpeg|png|webp|mp4|mov)$/i, '').trim() : ""; }
+
+  function parseCSV(text) {
+      const rows = []; let currentRow = []; let currentCell = ''; let insideQuote = false;
+      text = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+      for (let i = 0; i < text.length; i++) {
+          const char = text[i];
+          if (insideQuote) { if (char === '"' && text[i+1] === '"') { currentCell += '"'; i++; } else if (char === '"') insideQuote = false; else currentCell += char; }
+          else { if (char === '"') insideQuote = true; else if (char === ',') { currentRow.push(currentCell.trim()); currentCell = ''; } else if (char === '\n') { currentRow.push(currentCell.trim()); if(currentRow.length) rows.push(currentRow); currentRow=[]; currentCell=''; } else currentCell += char; }
+      }
+      if (currentCell || currentRow.length) { currentRow.push(currentCell.trim()); rows.push(currentRow); }
+      
+      const data = [];
+      const start = (rows[0] && rows[0][0].toLowerCase().includes('filename')) ? 1 : 0;
+      for (let i = start; i < rows.length; i++) {
+          const r = rows[i]; if(r.length < 2) continue;
+          data.push({ 
+              cleanName: normalizeName(r[0]), 
+              prompt: r[1]||r[2]||r[3]||"" // Simplified column logic
+          });
+      }
+      return data;
+  }
+
+  async function handleStart() {
+      const folderId = document.getElementById('folderSelect').value;
+      const file = document.getElementById('csvFile').files[0];
+      if(!folderId || !file) return alert("Select folder & CSV");
+
+      const s = Storage.get('rw_selectors');
+      if(!s.assets || !s.prompt) return alert("Train Robots First!");
+
+      STATE.stopRequested = false;
+      STATE.isPaused = false;
+      document.getElementById('startAutoBtn').style.display = 'none';
+
+      try {
+          const text = await file.text();
+          const rows = parseCSV(text);
+          const assets = await getAssetsInFolder(folderId);
+
+          if(!assets.length) throw new Error("Folder empty");
+
+          const queue = [];
+          rows.forEach(row => {
+              const match = assets.find(a => normalizeName(a.name).includes(row.cleanName));
+              if(match) queue.push({ ...row, assetName: match.name });
+          });
+
+          if(!queue.length) throw new Error("No CSV matches found in folder.");
+
+          const delayRange = document.getElementById('delayPreset').value.split("-").map(Number);
+          
+          await runQueue(queue, {min: delayRange[0], max: delayRange[1]}, s);
+
+      } catch(e) {
+          updateStatus("Error: " + e.message, "#ef4444");
+          alert(e.message);
+      } finally {
+          document.getElementById('startAutoBtn').style.display = 'block';
+      }
+  }
+
+  async function runQueue(queue, delay, s) {
+      for (let i = 0; i < queue.length; i++) {
+          if (STATE.stopRequested) break;
+          while(STATE.isPaused) { updateStatus("PAUSED", "#fbbf24"); await sleep(1000); }
+
+          const item = queue[i];
+          updateStatus(`Job ${i+1}/${queue.length}: ${item.cleanName}`, "#d946ef");
+
+          // 1. Wait for idle
+          while(document.body.innerText.includes("Generating") || document.body.innerText.includes("Queued")) {
+              updateStatus("Waiting...", "#fbbf24"); await sleep(2000);
+          }
+
+          // 2. Remove previous (if needed)
+          if(i > 0 && s.remove) {
+              await performClick(s.remove, 1000); await sleep(1500);
+          }
+
+          if(STATE.stopRequested) break;
+
+          // 3. Open Assets
+          updateStatus("Opening Assets...", "#38bdf8");
+          await performClick(s.assets, 1000); await sleep(2500);
+
+          // 4. Search
+          updateStatus("Searching...", "#38bdf8");
+          if(await performClick(s.search, 1000)) {
+              const [x, y] = s.search.split(":")[1].split(",").map(Number);
+              let el = document.elementFromPoint(x, y);
+              if(el && el.tagName !== 'INPUT') el = el.querySelector('input') || el.closest('input');
+              if(el) {
+                  el.focus(); document.execCommand('selectAll'); document.execCommand('delete');
+                  document.execCommand('insertText', false, item.cleanName);
+                  el.dispatchEvent(new Event('input', {bubbles:true}));
+                  await sleep(3000);
+              }
+          }
+
+          // 5. Select Image
+          updateStatus("Selecting Image...", "#38bdf8");
+          let found = await performClick(s.image, 1000, true); 
+          if(!found) {
+              // Fallback logic for finding grid item
+              let grid = document.querySelector('div[data-testid="asset-grid-item"]');
+              if(grid) { grid.click(); await sleep(50); grid.click(); found = true; }
+          }
+          if(!found) { updateStatus("Img Not Found", "#ef4444"); continue; }
+          await sleep(2000);
+
+          // 6. Prompt
+          updateStatus("Typing Prompt...", "#38bdf8");
+          if(await performClick(s.prompt, 1000)) {
+              const [x, y] = s.prompt.split(":")[1].split(",").map(Number);
+              let el = document.elementFromPoint(x, y);
+              if(el && el.tagName !== 'TEXTAREA') el = el.querySelector('textarea') || el.closest('textarea') || el;
+              el.focus(); document.execCommand('selectAll'); document.execCommand('delete');
+              document.execCommand('insertText', false, item.prompt);
+              await sleep(2000);
+          }
+
+          // 7. Generate
+          updateStatus("Generating...", "#22c55e");
+          const btns = Array.from(document.querySelectorAll('button'));
+          const genBtn = btns.find(b => b.innerText.trim().toLowerCase().startsWith('generate'));
+          if(genBtn && !genBtn.disabled) {
+              genBtn.click();
+              await sleep(3000);
+          } else {
+              updateStatus("Gen Button Blocked", "#ef4444");
+          }
+
+          // 8. Random Delay
+          const wait = Math.floor(Math.random() * (delay.max - delay.min + 1) + delay.min);
+          for(let k=wait; k>0; k--) {
+             if(STATE.stopRequested) break;
+             updateStatus(`Cooldown: ${k}s`, "#fbbf24");
+             await sleep(1000);
+          }
+      }
+      updateStatus("Batch Complete!", "#22c55e");
+  }
+
+  // START
+  setTimeout(createFloatingUI, 1500);
+
+})();
